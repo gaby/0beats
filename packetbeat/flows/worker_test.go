@@ -30,7 +30,6 @@ import (
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/packetbeat/procs"
-	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/mapstr"
 	"github.com/elastic/go-lookslike"
 	"github.com/elastic/go-lookslike/isdef"
@@ -40,7 +39,6 @@ import (
 var dataFlag = flag.Bool("data", false, "Write updated data.json files")
 
 func TestCreateEvent(t *testing.T) {
-	logp.TestingSetup()
 
 	// Build biflow event.
 	start := time.Unix(1542292881, 0)
@@ -164,7 +162,6 @@ func TestCreateEvent(t *testing.T) {
 }
 
 func TestFlowsProcessorExecuteUnlocksBeforeReporting(t *testing.T) {
-	logp.TestingSetup()
 
 	table := &flowMetaTable{
 		table: make(map[flowIDMeta]*flowTable),
@@ -255,7 +252,6 @@ func TestFlowsProcessorExecuteUnlocksBeforeReporting(t *testing.T) {
 }
 
 func TestFlowsProcessorExecuteResetsStatsWithDeltaReporting(t *testing.T) {
-	logp.TestingSetup()
 
 	table := &flowMetaTable{
 		table: make(map[flowIDMeta]*flowTable),
