@@ -20,15 +20,18 @@ package flows
 import (
 	"encoding/json"
 	"flag"
+	"net"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/packetbeat/procs"
 	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 	"github.com/elastic/go-lookslike"
 	"github.com/elastic/go-lookslike/isdef"
 )
@@ -65,7 +68,8 @@ func TestCreateEvent(t *testing.T) {
 	}
 	bif.stats[0] = &flowStats{uintFlags: []uint8{1, 1}, uints: []uint64{10, 1}}
 	bif.stats[1] = &flowStats{uintFlags: []uint8{1, 1}, uints: []uint64{460, 2}}
-	event := createEvent(&procs.ProcessesWatcher{}, time.Now(), bif, true, nil, []string{"bytes", "packets"}, nil, false)
+	snapshot := newFlowSnapshot(bif, true, nil, []string{"bytes", "packets"}, nil, false)
+	event := createEvent(&procs.ProcessesWatcher{}, time.Now(), &snapshot)
 
 	// Validate the contents of the event.
 	validate := lookslike.MustCompile(map[string]interface{}{
@@ -142,7 +146,8 @@ func TestCreateEvent(t *testing.T) {
 	assert.NotEqual(t, expectbiFlow.stats[0].uints, bif.stats[0].uints)
 	assert.NotEqual(t, expectbiFlow.stats[1].uints, bif.stats[1].uints)
 
-	event = createEvent(&procs.ProcessesWatcher{}, time.Now(), bif, true, nil, []string{"bytes", "packets"}, nil, true)
+	snapshot = newFlowSnapshot(bif, true, nil, []string{"bytes", "packets"}, nil, true)
+	event = createEvent(&procs.ProcessesWatcher{}, time.Now(), &snapshot)
 	result = validate(event.Fields)
 	if errs := result.Errors(); len(errs) > 0 {
 		for _, err := range errs {
@@ -156,4 +161,169 @@ func TestCreateEvent(t *testing.T) {
 	assert.Equal(t, expectbiFlow.stats[0].uints, bif.stats[0].uints)
 	assert.Equal(t, expectbiFlow.stats[1].uintFlags, bif.stats[1].uintFlags)
 	assert.Equal(t, expectbiFlow.stats[1].uints, bif.stats[1].uints)
+}
+
+func TestFlowsProcessorExecuteUnlocksBeforeReporting(t *testing.T) {
+	logp.TestingSetup()
+
+	table := &flowMetaTable{
+		table: make(map[flowIDMeta]*flowTable),
+	}
+
+	id := newFlowID()
+	srcIP := net.IP{192, 0, 2, 1}
+	dstIP := net.IP{198, 51, 100, 2}
+	id.AddIPv4(srcIP, dstIP)
+	id.AddTCP(12345, 80)
+
+	now := time.Now()
+	flow := &biFlow{
+		id:       id.rawFlowID,
+		createTS: now.Add(-time.Second),
+		ts:       now,
+		dir:      flowDirForward,
+	}
+	flow.stats[0] = &flowStats{
+		uintFlags: []uint8{3},
+		uints:     []uint64{100, 10},
+	}
+
+	ft := &flowTable{
+		table: map[string]*biFlow{string(flow.id.flowID): flow},
+	}
+	ft.flows.append(flow)
+	table.table[flow.id.flowIDMeta] = ft
+	table.tables.append(ft)
+
+	counters := &counterReg{}
+	counters.uints.names = []string{"bytes", "packets"}
+
+	var reported []beat.Event
+	reporter := func(events []beat.Event) {
+		acquired := make(chan struct{}, 1)
+		go func() {
+			table.Lock()
+			table.Unlock()
+			acquired <- struct{}{}
+		}()
+
+		select {
+		case <-acquired:
+		case <-time.After(time.Second):
+			t.Fatal("table lock held while publishing events")
+		}
+
+		reported = append(reported, events...)
+	}
+
+	processor := &flowsProcessor{
+		watcher:                  &procs.ProcessesWatcher{},
+		table:                    table,
+		counters:                 counters,
+		enableDeltaFlowReporting: false,
+	}
+	processor.spool.init(reporter, 10)
+
+	processor.execute(nil, false, true, false)
+
+	if len(reported) != 1 {
+		t.Fatalf("expected 1 reported event, got %d", len(reported))
+	}
+
+	event := reported[0]
+	network, ok := event.Fields["network"].(mapstr.M)
+	if !ok {
+		t.Fatalf("network fields missing from event: %+v", event.Fields)
+	}
+	assert.Equal(t, uint64(100), network["bytes"])
+	assert.Equal(t, uint64(10), network["packets"])
+	assert.Equal(t, "tcp", network["transport"])
+
+	source, ok := event.Fields["source"].(mapstr.M)
+	if !ok {
+		t.Fatalf("source fields missing from event: %+v", event.Fields)
+	}
+	assert.Equal(t, "192.0.2.1", source["ip"])
+	assert.Equal(t, uint16(12345), source["port"])
+
+	destination, ok := event.Fields["destination"].(mapstr.M)
+	if !ok {
+		t.Fatalf("destination fields missing from event: %+v", event.Fields)
+	}
+	assert.Equal(t, "198.51.100.2", destination["ip"])
+	assert.Equal(t, uint16(80), destination["port"])
+}
+
+func TestFlowsProcessorExecuteResetsStatsWithDeltaReporting(t *testing.T) {
+	logp.TestingSetup()
+
+	table := &flowMetaTable{
+		table: make(map[flowIDMeta]*flowTable),
+	}
+
+	id := newFlowID()
+	srcIP := net.IP{10, 0, 0, 1}
+	dstIP := net.IP{10, 0, 0, 2}
+	id.AddIPv4(srcIP, dstIP)
+	id.AddTCP(5050, 8080)
+
+	now := time.Now()
+	flow := &biFlow{
+		id:       id.rawFlowID,
+		createTS: now.Add(-2 * time.Second),
+		ts:       now,
+		dir:      flowDirForward,
+	}
+	flow.stats[0] = &flowStats{
+		uintFlags: []uint8{3},
+		uints:     []uint64{150, 9},
+	}
+	flow.stats[1] = &flowStats{
+		uintFlags: []uint8{3},
+		uints:     []uint64{75, 6},
+	}
+
+	ft := &flowTable{
+		table: map[string]*biFlow{string(flow.id.flowID): flow},
+	}
+	ft.flows.append(flow)
+	table.table[flow.id.flowIDMeta] = ft
+	table.tables.append(ft)
+
+	counters := &counterReg{}
+	counters.uints.names = []string{"bytes", "packets"}
+
+	var reported []beat.Event
+	reporter := func(events []beat.Event) {
+		reported = append(reported, events...)
+	}
+
+	processor := &flowsProcessor{
+		watcher:                  &procs.ProcessesWatcher{},
+		table:                    table,
+		counters:                 counters,
+		enableDeltaFlowReporting: true,
+	}
+	processor.spool.init(reporter, 10)
+
+	// Ensure counters are non-zero before executing so we can verify resets later.
+	assert.NotEqual(t, []uint64{0, 0}, flow.stats[0].uints)
+	assert.NotEqual(t, []uint64{0, 0}, flow.stats[1].uints)
+
+	processor.execute(nil, false, true, false)
+
+	if len(reported) != 1 {
+		t.Fatalf("expected 1 reported event, got %d", len(reported))
+	}
+
+	event := reported[0]
+	network, ok := event.Fields["network"].(mapstr.M)
+	if !ok {
+		t.Fatalf("network fields missing from event: %+v", event.Fields)
+	}
+	assert.Equal(t, uint64(225), network["bytes"])
+	assert.Equal(t, uint64(15), network["packets"])
+
+	assert.Equal(t, []uint64{0, 0}, flow.stats[0].uints)
+	assert.Equal(t, []uint64{0, 0}, flow.stats[1].uints)
 }
