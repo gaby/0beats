@@ -111,6 +111,52 @@ func (t *flowTable) remove(f *biFlow) {
 	t.flows.remove(f)
 }
 
+func (t *flowTable) collectSnapshots(
+	dst []flowSnapshot,
+	ts time.Time,
+	timeout time.Duration,
+	checkTimeout bool,
+	handleReports bool,
+	lastReport bool,
+	intNames []string,
+	uintNames []string,
+	floatNames []string,
+	enableDeltaFlowReporting bool,
+) []flowSnapshot {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	for flow := t.flows.head; flow != nil; {
+		next := flow.next
+
+		debugf("handle flow: %v, %v", flow.id.flowIDMeta, flow.id.flowID)
+
+		reportFlow := handleReports
+		isOver := lastReport
+		if checkTimeout {
+			if ts.Sub(flow.ts) > timeout {
+				debugf("kill flow")
+
+				reportFlow = true
+				flow.kill() // mark flow as killed
+				isOver = true
+				delete(t.table, string(flow.id.flowID))
+				t.flows.remove(flow)
+			}
+		}
+
+		if reportFlow {
+			debugf("report flow")
+			snapshot := newFlowSnapshot(flow, isOver, intNames, uintNames, floatNames, enableDeltaFlowReporting)
+			dst = append(dst, snapshot)
+		}
+
+		flow = next
+	}
+
+	return dst
+}
+
 func (l *flowTableList) append(t *flowTable) {
 	t.prev = l.tail
 	t.next = nil

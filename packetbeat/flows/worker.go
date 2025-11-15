@@ -230,6 +230,14 @@ type flowsProcessor struct {
 	enableDeltaFlowReporting bool
 }
 
+type flowSnapshot struct {
+	id       rawFlowID
+	createTS time.Time
+	ts       time.Time
+	isOver   bool
+	stats    [2]map[string]interface{}
+}
+
 func (fw *flowsProcessor) execute(w *worker, checkTimeout, handleReports, lastReport bool) {
 	if !checkTimeout && !handleReports {
 		return
@@ -244,72 +252,85 @@ func (fw *flowsProcessor) execute(w *worker, checkTimeout, handleReports, lastRe
 	floatNames := fw.counters.floats.getNames()
 	fw.counters.mutex.Unlock()
 
-	fw.table.Lock()
-	defer fw.table.Unlock()
 	ts := time.Now()
+	var snapshots []flowSnapshot
 
-	// TODO: create snapshot inside flows/tables, so deletion of timed-out flows
-	//       and reporting flows stats can be done more concurrent to packet
-	//       processing.
+	var tables []*flowTable
 
+	fw.table.Lock()
 	for table := fw.table.tables.head; table != nil; table = table.next {
-		var next *biFlow
-		for flow := table.flows.head; flow != nil; flow = next {
-			next = flow.next
+		tables = append(tables, table)
+	}
+	fw.table.Unlock()
 
-			debugf("handle flow: %v, %v", flow.id.flowIDMeta, flow.id.flowID)
+	for _, table := range tables {
+		snapshots = table.collectSnapshots(
+			snapshots,
+			ts,
+			fw.timeout,
+			checkTimeout,
+			handleReports,
+			lastReport,
+			intNames,
+			uintNames,
+			floatNames,
+			fw.enableDeltaFlowReporting,
+		)
+	}
 
-			reportFlow := handleReports
-			isOver := lastReport
-			if checkTimeout {
-				if ts.Sub(flow.ts) > fw.timeout {
-					debugf("kill flow")
-
-					reportFlow = true
-					flow.kill() // mark flow as killed
-					isOver = true
-					table.remove(flow)
-				}
-			}
-
-			if reportFlow {
-				debugf("report flow")
-				fw.report(w, ts, flow, isOver, intNames, uintNames, floatNames)
-			}
-		}
+	for i := range snapshots {
+		event := createEvent(fw.watcher, ts, &snapshots[i])
+		fw.report(event)
 	}
 
 	fw.spool.flush()
 }
 
-func (fw *flowsProcessor) report(w *worker, ts time.Time, flow *biFlow, isOver bool, intNames, uintNames, floatNames []string) {
-	event := createEvent(fw.watcher, ts, flow, isOver, intNames, uintNames, floatNames, fw.enableDeltaFlowReporting)
+func newFlowSnapshot(flow *biFlow, isOver bool, intNames, uintNames, floatNames []string, enableDeltaFlowReporting bool) flowSnapshot {
+	snapshot := flowSnapshot{
+		id:       flow.id.clone(),
+		createTS: flow.createTS,
+		ts:       flow.ts,
+		isOver:   isOver,
+	}
 
+	if flow.stats[0] != nil {
+		snapshot.stats[0] = encodeStats(flow.stats[0], intNames, uintNames, floatNames, enableDeltaFlowReporting)
+	}
+
+	if flow.stats[1] != nil {
+		snapshot.stats[1] = encodeStats(flow.stats[1], intNames, uintNames, floatNames, enableDeltaFlowReporting)
+	}
+
+	return snapshot
+}
+
+func (fw *flowsProcessor) report(event beat.Event) {
 	debugf("add event: %v", event)
 	fw.spool.publish(event)
 }
 
-func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOver bool, intNames, uintNames, floatNames []string, enableDeltaFlowReporting bool) beat.Event {
+func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, snapshot *flowSnapshot) beat.Event {
 	timestamp := ts
 
 	event := mapstr.M{
-		"start":    common.Time(f.createTS),
-		"end":      common.Time(f.ts),
-		"duration": f.ts.Sub(f.createTS),
+		"start":    common.Time(snapshot.createTS),
+		"end":      common.Time(snapshot.ts),
+		"duration": snapshot.ts.Sub(snapshot.createTS),
 		"dataset":  "flow",
 		"kind":     "event",
 		"category": []string{"network"},
 		"action":   "network_flow",
 	}
 	eventType := []string{"connection"}
-	if isOver {
+	if snapshot.isOver {
 		eventType = append(eventType, "end")
 	}
 	event["type"] = eventType
 
 	flow := mapstr.M{
-		"id":    common.NetString(f.id.Serialize()),
-		"final": isOver,
+		"id":    common.NetString(snapshot.id.Serialize()),
+		"final": snapshot.isOver,
 	}
 	fields := mapstr.M{
 		"event": event,
@@ -324,23 +345,23 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 	var proto applayer.Transport
 
 	// add ethernet layer meta data
-	if src, dst, ok := f.id.EthAddr(); ok {
+	if src, dst, ok := snapshot.id.EthAddr(); ok {
 		source["mac"] = formatHardwareAddr(net.HardwareAddr(src))
 		dest["mac"] = formatHardwareAddr(net.HardwareAddr(dst))
 	}
 
 	// add vlan
-	if vlan := f.id.OutterVLan(); vlan != nil {
+	if vlan := snapshot.id.OutterVLan(); vlan != nil {
 		vlanID := uint64(binary.LittleEndian.Uint16(vlan))
 		putOrAppendUint64(flow, "vlan", vlanID)
 	}
-	if vlan := f.id.VLan(); vlan != nil {
+	if vlan := snapshot.id.VLan(); vlan != nil {
 		vlanID := uint64(binary.LittleEndian.Uint16(vlan))
 		putOrAppendUint64(flow, "vlan", vlanID)
 	}
 
 	// ipv4 layer meta data
-	if src, dst, ok := f.id.OutterIPv4Addr(); ok {
+	if src, dst, ok := snapshot.id.OutterIPv4Addr(); ok {
 		srcIP, dstIP := net.IP(src), net.IP(dst)
 		source["ip"] = srcIP.String()
 		dest["ip"] = dstIP.String()
@@ -351,7 +372,7 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 		communityID.SourceIP = srcIP
 		communityID.DestinationIP = dstIP
 	}
-	if src, dst, ok := f.id.IPv4Addr(); ok {
+	if src, dst, ok := snapshot.id.IPv4Addr(); ok {
 		srcIP, dstIP := net.IP(src), net.IP(dst)
 		putOrAppendString(source, "ip", srcIP.String())
 		putOrAppendString(dest, "ip", dstIP.String())
@@ -367,7 +388,7 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 	}
 
 	// ipv6 layer meta data
-	if src, dst, ok := f.id.OutterIPv6Addr(); ok {
+	if src, dst, ok := snapshot.id.OutterIPv6Addr(); ok {
 		srcIP, dstIP := net.IP(src), net.IP(dst)
 		putOrAppendString(source, "ip", srcIP.String())
 		putOrAppendString(dest, "ip", dstIP.String())
@@ -378,7 +399,7 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 		communityID.SourceIP = srcIP
 		communityID.DestinationIP = dstIP
 	}
-	if src, dst, ok := f.id.IPv6Addr(); ok {
+	if src, dst, ok := snapshot.id.IPv6Addr(); ok {
 		srcIP, dstIP := net.IP(src), net.IP(dst)
 		putOrAppendString(source, "ip", srcIP.String())
 		putOrAppendString(dest, "ip", dstIP.String())
@@ -394,7 +415,7 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 	}
 
 	// udp layer meta data
-	if src, dst, ok := f.id.UDPAddr(); ok {
+	if src, dst, ok := snapshot.id.UDPAddr(); ok {
 		tuple.SrcPort = binary.LittleEndian.Uint16(src)
 		tuple.DstPort = binary.LittleEndian.Uint16(dst)
 		source["port"], dest["port"] = tuple.SrcPort, tuple.DstPort
@@ -406,7 +427,7 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 	}
 
 	// tcp layer meta data
-	if src, dst, ok := f.id.TCPAddr(); ok {
+	if src, dst, ok := snapshot.id.TCPAddr(); ok {
 		tuple.SrcPort = binary.LittleEndian.Uint16(src)
 		tuple.DstPort = binary.LittleEndian.Uint16(dst)
 		source["port"], dest["port"] = tuple.SrcPort, tuple.DstPort
@@ -418,9 +439,9 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 	}
 
 	var totalBytes, totalPackets uint64
-	if f.stats[0] != nil {
+	if snapshot.stats[0] != nil {
 		// Source stats.
-		stats := encodeStats(f.stats[0], intNames, uintNames, floatNames, enableDeltaFlowReporting)
+		stats := snapshot.stats[0]
 		for k, v := range stats {
 			switch k {
 			case "icmpV4TypeCode":
@@ -451,9 +472,9 @@ func createEvent(watcher *procs.ProcessesWatcher, ts time.Time, f *biFlow, isOve
 			totalPackets += v.(uint64)
 		}
 	}
-	if f.stats[1] != nil {
+	if snapshot.stats[1] != nil {
 		// Destination stats.
-		stats := encodeStats(f.stats[1], intNames, uintNames, floatNames, enableDeltaFlowReporting)
+		stats := snapshot.stats[1]
 		for k, v := range stats {
 			switch k {
 			case "icmpV4TypeCode", "icmpV6TypeCode":
