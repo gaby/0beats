@@ -16471,11 +16471,11 @@ Contents of probable licence file $GOMODCACHE/github.com/gomodule/redigo@v1.9.3/
 
 --------------------------------------------------------------------------------
 Dependency : github.com/google/cel-go
-Version: v0.28.0
+Version: v0.29.0
 Licence type (autodetected): Apache-2.0
 --------------------------------------------------------------------------------
 
-Contents of probable licence file $GOMODCACHE/github.com/google/cel-go@v0.28.0/LICENSE:
+Contents of probable licence file $GOMODCACHE/github.com/google/cel-go@v0.29.0/LICENSE:
 
 
                                  Apache License
@@ -49336,11 +49336,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
 Dependency : github.com/containerd/containerd/v2
-Version: v2.2.4
+Version: v2.2.5
 Licence type (autodetected): Apache-2.0
 --------------------------------------------------------------------------------
 
-Contents of probable licence file $GOMODCACHE/github.com/containerd/containerd/v2@v2.2.4/LICENSE:
+Contents of probable licence file $GOMODCACHE/github.com/containerd/containerd/v2@v2.2.5/LICENSE:
 
 
                                  Apache License
